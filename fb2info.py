@@ -8,53 +8,81 @@ from io import BytesIO
 from urllib.request import url2pathname
 
 
+def local_name(tag):
+    """Return local tag name without namespace."""
+    return tag.rsplit('}', 1)[-1]
+
+
 def save_cover(cover_raw, output_file, size):
     try:
         cover_decoded = base64.b64decode(cover_raw)
         cover = Image.open(BytesIO(cover_decoded))
-        cover.thumbnail((size, size), Image.Resampling.LANCZOS)
+        try:
+            resample = Image.Resampling.LANCZOS
+        except AttributeError:
+            resample = Image.LANCZOS
+        cover.thumbnail((size, size), resample)
         cover.save(output_file, "PNG")
         return True
     except Exception as e:
-        print(e)
+        print(f"save_cover: {e}", file=sys.stderr)
         return False
 
 
+def find_by_path(root, path):
+    """Find element by local-name path, e.g. 'description/title-info/coverpage/image'."""
+    parts = path.split('/')
+    candidates = [root]
+    for part in parts:
+        next_candidates = []
+        for c in candidates:
+            for child in c:
+                if local_name(child.tag) == part:
+                    next_candidates.append(child)
+        candidates = next_candidates
+        if not candidates:
+            return None
+    return candidates[0] if candidates else None
+
+
 def get_cover_id(root):
-    cover_page = root.find('.//description/title-info/coverpage/image')
+    cover_page = find_by_path(root, 'description/title-info/coverpage/image')
     if cover_page is None:
-        cover_page = root.find('.//{*}description/{*}title-info/{*}coverpage/{*}image')
+        # fallback: body/image (прямой потомок body)
+        body = find_by_path(root, 'body')
+        if body is not None:
+            for child in body:
+                if local_name(child.tag) == 'image':
+                    cover_page = child
+                    break
     if cover_page is None:
-        cover_page = root.find('.//body/image')
-    if cover_page is None:
-        cover_page = root.find('.//{*}body/{*}image')
-    if cover_page is None or cover_page.attrib is None:
         return None
-    cover_id = None
     for k, v in cover_page.attrib.items():
-        if v and len(v) > 0 and k.endswith('href'):
-            cover_id = v[1:]
-            break
-    return cover_id
+        if v and k.endswith('href'):
+            return v[1:] if v.startswith('#') else v
+    return None
 
 
 def try_without_cover_id(root, output_file, size):
-    # fallback: look for cover by id attribute
+    # 1) cover by id attribute
     for i in root.iter():
-        if (i.tag.split('}')[1] == 'binary') and ('id' in i.attrib) and (i.attrib['id'].split('.')[0] == 'cover'):
+        if local_name(i.tag) == 'binary' and i.attrib.get('id', '').split('.')[0] == 'cover':
             print("Found by cover attribute")
             if save_cover(i.text, output_file, size):
                 return True
-    # fallback: look for any image
+    # 2) any image by content-type
     for i in root.iter():
-        if (i.tag.split('}')[1] == 'binary') and ('content-type' in i.attrib) and (i.attrib['content-type'].split('/')[0] == 'image'):
+        if local_name(i.tag) == 'binary' and i.attrib.get('content-type', '').split('/')[0] == 'image':
             print("Found by image type")
             if save_cover(i.text, output_file, size):
                 return True
-    # fallback: look for jpg/png by content-type id
+    # 3) jpg/png by id
     for i in root.iter():
-        if (i.tag.split('}')[1] == 'binary') and ('content-type' in i.attrib) and ('id' in i.attrib) and (i.attrib['id'].split('.')[1].lower() in ['jpg', 'png']):
-            print("Found by image type")
+        if local_name(i.tag) != 'binary':
+            continue
+        id_parts = i.attrib.get('id', '').split('.')
+        if len(id_parts) > 1 and id_parts[1].lower() in ('jpg', 'png'):
+            print("Found by image id")
             if save_cover(i.text, output_file, size):
                 return True
     return False
@@ -62,41 +90,47 @@ def try_without_cover_id(root, output_file, size):
 
 def main():
     if len(sys.argv) < 3:
-        print('Not enough actual parameters')
-        sys.exit(1)
+        print('Not enough actual parameters', file=sys.stderr)
+        return 1
 
     input_file = sys.argv[1]
     output_file = sys.argv[2]
-    size = int(sys.argv[3]) if len(sys.argv) > 3 else 256
+    try:
+        size = max(1, int(sys.argv[3])) if len(sys.argv) > 3 else 256
+    except ValueError:
+        print(f"Invalid size: {sys.argv[3]}", file=sys.stderr)
+        return 1
 
     if input_file.startswith('file://'):
-        input_file = url2pathname(input_file).split('file://')[1]
+        input_file = url2pathname(input_file)  # уже без 'file://'
 
     with open(input_file, 'rb') as f:
         raw = f.read()
 
-    # Strip UTF-8 BOM if present
     if raw.startswith(b'\xef\xbb\xbf'):
         raw = raw[3:]
 
-    # Normalize 'windows-1251' (hyphen) to 'cp1251' (underscore)
-    # so ElementTree can recognize the encoding declaration
-    raw = raw.replace(b'windows-1251', b'cp1251')
+    # Заменяем только в XML declaration (до первого '?>')
+    head, sep, tail = raw.partition(b'?>')
+    if b'windows-1251' in head:
+        raw = head.replace(b'windows-1251', b'cp1251') + sep + tail
 
     root = ET.parse(BytesIO(raw)).getroot()
 
     cover_id = get_cover_id(root)
     if cover_id:
         for i in root.iter():
-            if (i.tag.split('}')[1] == 'binary') and ('id' in i.attrib) and (i.attrib['id'] == cover_id):
+            if local_name(i.tag) == 'binary' and i.attrib.get('id') == cover_id:
                 print(f"Found by coverpage = #{cover_id}")
                 if save_cover(i.text, output_file, size):
-                    sys.exit(0)
+                    return 0
 
     if not try_without_cover_id(root, output_file, size):
-        print('No cover inside')
-        sys.exit(2)
+        print('No cover inside', file=sys.stderr)
+        return 2
+
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())
